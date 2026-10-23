@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Glasses Blend Test</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; color: #fff; }
+  #cam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #out { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; mix-blend-mode: screen; transform-origin: center; }
+  #src { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #msg { position: absolute; top: calc(10px + env(safe-area-inset-top, 0px)); left: 12px; right: 12px; font-size: 14px; text-shadow: 0 0 4px #000; pointer-events: none; }
+  #panel {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+    background: rgba(0,0,0,.8); display: flex; flex-direction: column; gap: 10px;
+    max-height: 60%; overflow-y: auto;
+  }
+  #panel.hidden { display: none; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 14px; }
+  .row .lbl { width: 92px; }
+  button, label.btn, select {
+    background: #2a2a2a; color: #fff; border: 1px solid #555; border-radius: 8px;
+    padding: 9px 12px; font-size: 14px;
+  }
+  button.on { background: #1d4f91; border-color: #5aa0ff; }
+  input[type=file] { display: none; }
+  input[type=range] { flex: 1; min-width: 110px; }
+  #show { position: absolute; top: calc(8px + env(safe-area-inset-top, 0px)); right: 8px; display: none; opacity: .5; }
+</style>
+</head>
+<body>
+<video id="cam" autoplay playsinline muted></video>
+<canvas id="out"></canvas>
+<video id="src" loop playsinline></video>
+<div id="msg">Pick a video to begin.</div>
+<button id="show">Controls</button>
+
+<div id="panel">
+  <div class="row">
+    <label class="btn">Pick video<input id="file" type="file" accept="video/*"></label>
+    <button id="play">Play / Pause</button>
+    <button id="hide">Hide controls</button>
+  </div>
+
+  <div class="row">
+    <span class="lbl">View</span>
+    <button id="mPhone" class="on">Phone (camera behind)</button>
+    <button id="mGlasses">Glasses (black bg)</button>
+  </div>
+  <div class="row">
+    <button id="flip">Flip camera</button>
+    <button id="full">Fullscreen</button>
+  </div>
+
+  <div class="row">
+    <span class="lbl">Background</span>
+    <select id="key">
+      <option value="black">Black (leave as is)</option>
+      <option value="green">Green screen (remove)</option>
+    </select>
+  </div>
+  <div class="row"><span class="lbl">Green range</span><input id="thr" type="range" min="5" max="150" value="40"></div>
+  <div class="row"><span class="lbl">Edge softness</span><input id="soft" type="range" min="5" max="150" value="40"></div>
+  <div class="row"><span class="lbl">Size</span><input id="size" type="range" min="20" max="200" value="100"></div>
+  <div class="row"><span class="lbl">Brightness</span><input id="bright" type="range" min="50" max="250" value="100"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cam = $('cam'), src = $('src'), out = $('out'), msg = $('msg'), panel = $('panel'), showBtn = $('show');
+const ctx = out.getContext('2d', { willReadFrequently: true });
+let facing = 'environment', stream = null, mode = 'phone';
+const MAX_W = 640; // processing width, keeps green keying smooth
+
+async function startCamera() {
+  if (mode !== 'phone') return;
+  try {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing }, audio: false });
+    cam.srcObject = stream;
+    cam.style.display = 'block';
+  } catch (e) {
+    cam.style.display = 'none';
+    msg.textContent = 'No camera (' + e.message + '). Glasses view still works.';
+  }
+}
+function stopCamera() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  cam.srcObject = null;
+  cam.style.display = 'none';
+}
+
+function setMode(m) {
+  mode = m;
+  $('mPhone').classList.toggle('on', m === 'phone');
+  $('mGlasses').classList.toggle('on', m === 'glasses');
+  if (m === 'phone') startCamera(); else stopCamera();
+  if (m === 'glasses') {
+    msg.textContent = 'Glasses view: tap the screen to show/hide controls.';
+  }
+}
+
+function applyStyle() {
+  out.style.transform = 'scale(' + ($('size').value / 100) + ')';
+  out.style.filter = 'brightness(' + ($('bright').value / 100) + ')';
+}
+
+function drawFrame() {
+  if (src.readyState < 2 || !src.videoWidth) return;
+  const scale = Math.min(1, MAX_W / src.videoWidth);
+  const w = Math.round(src.videoWidth * scale), h = Math.round(src.videoHeight * scale);
+  if (out.width !== w || out.height !== h) { out.width = w; out.height = h; }
+  ctx.drawImage(src, 0, 0, w, h);
+  if ($('key').value !== 'green') return;
+
+  const thr = +$('thr').value, soft = +$('soft').value;
+  const img = ctx.getImageData(0, 0, w, h), d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    const dom = g - (r > b ? r : b);        // how "green" the pixel is
+    if (dom > thr) {
+      let a = 1 - (dom - thr) / soft;       // 1 = keep, 0 = removed
+      if (a < 0) a = 0;
+      d[i] = r * a; d[i + 1] = g * a; d[i + 2] = b * a;  // fade toward black = transparent
+    } else if (dom > 0) {
+      d[i + 1] = g - dom * 0.5;             // light green despill on edges
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function loop() {
+  drawFrame();
+  if (src.requestVideoFrameCallback) src.requestVideoFrameCallback(loop);
+  else requestAnimationFrame(loop);
+}
+
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  src.src = URL.createObjectURL(f);
+  src.play().catch(() => {});
+  msg.textContent = '';
+  loop();
+});
+$('play').addEventListener('click', () => { if (src.src) src.paused ? src.play() : src.pause(); });
+$('flip').addEventListener('click', () => { facing = facing === 'environment' ? 'user' : 'environment'; startCamera(); });
+$('mPhone').addEventListener('click', () => setMode('phone'));
+$('mGlasses').addEventListener('click', () => setMode('glasses'));
+$('full').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+});
+$('hide').addEventListener('click', () => { panel.classList.add('hidden'); showBtn.style.display = 'block'; });
+showBtn.addEventListener('click', () => { panel.classList.remove('hidden'); showBtn.style.display = 'none'; });
+out.addEventListener('click', () => {
+  if (panel.classList.contains('hidden')) { panel.classList.remove('hidden'); showBtn.style.display = 'none'; }
+  else { panel.classList.add('hidden'); showBtn.style.display = 'block'; }
+});
+['size', 'bright'].forEach(id => $(id).addEventListener('input', applyStyle));
+src.addEventListener('play', loop);
+
+applyStyle();
+startCamera();
+</script>
+</body>
+</html>
