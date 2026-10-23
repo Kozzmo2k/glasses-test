@@ -8,8 +8,9 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; color: #fff; touch-action: none; user-select: none; -webkit-user-select: none; }
   #cam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  #out { position: absolute; left: 50%; top: 50%; mix-blend-mode: screen; }
-  #gl { position: absolute; inset: 0; width: 100%; height: 100%; mix-blend-mode: screen; display: none; }
+  #out { position: absolute; left: 50%; top: 50%; }
+  #gl { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+  body.add #out, body.add #gl { mix-blend-mode: screen; }
   body.picking #out, body.picking #gl { cursor: crosshair; }
   #src { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
   #msg { position: absolute; top: calc(10px + env(safe-area-inset-top, 0px)); left: 12px; right: 60px; font-size: 14px; text-shadow: 0 0 4px #000; pointer-events: none; }
@@ -100,6 +101,13 @@
     <span id="sw"></span>
     <button id="pick">Eyedropper</button>
     <input id="kc" type="color" value="#00ff00">
+  </div>
+  <div class="row">
+    <span class="lbl">Compositing</span>
+    <select id="comp">
+      <option value="cut">Solid cutout (person is opaque)</option>
+      <option value="add">Glasses-style glow (black = clear)</option>
+    </select>
   </div>
   <div class="row"><span class="lbl">Tolerance</span><input id="tol" type="range" min="0" max="250" value="60"></div>
   <div class="row"><span class="lbl">Edge softness</span><input id="soft" type="range" min="1" max="150" value="40"></div>
@@ -204,16 +212,20 @@ function drawFrame() {
   if (!G || src.readyState < 2) return;
   wctx.drawImage(src, G.sx, G.sy, G.sw, G.sh, 0, 0, G.w, G.h);
   ctx.drawImage(work, 0, 0);
-  if ($('key').value !== 'color') return;
+  const useKey = $('key').value === 'color', cut = $('comp').value === 'cut';
+  if (!useKey && !cut) return;
 
   const t = +$('tol').value, s = +$('soft').value;
   const t2 = t * t, e = t + s, e2 = e * e;
   const img = ctx.getImageData(0, 0, G.w, G.h), d = img.data;
-  const kr = key.r, kg = key.g, kb = key.b;
+  const kr = useKey ? key.r : 0, kg = useKey ? key.g : 0, kb = useKey ? key.b : 0;   // no color chosen: treat black as clear
   for (let i = 0; i < d.length; i += 4) {
     const dr = d[i] - kr, dg = d[i + 1] - kg, db = d[i + 2] - kb;
     const d2 = dr * dr + dg * dg + db * db;
-    if (d2 <= t2) { d[i] = 0; d[i + 1] = 0; d[i + 2] = 0; }
+    if (cut) {
+      if (d2 <= t2) d[i + 3] = 0;
+      else if (d2 < e2) d[i + 3] = ((Math.sqrt(d2) - t) / s) * 255;
+    } else if (d2 <= t2) { d[i] = 0; d[i + 1] = 0; d[i + 2] = 0; }
     else if (d2 < e2) {
       const a = (Math.sqrt(d2) - t) / s;
       d[i] *= a; d[i + 1] *= a; d[i + 2] *= a;
@@ -338,7 +350,7 @@ function initGL() {
     'precision highp float;',
     'varying vec2 vP;',
     'uniform sampler2D uTex; uniform mat3 uRot; uniform float uTan; uniform float uAsp; uniform float uHalf;',
-    'uniform vec2 uOff; uniform vec2 uScl; uniform vec3 uKey; uniform vec2 uTS; uniform float uKeyOn;',
+    'uniform vec2 uOff; uniform vec2 uScl; uniform vec3 uKey; uniform vec2 uTS; uniform float uKeyOn; uniform float uCut;',
     'void main(){',
     '  vec3 d = normalize(vec3(vP.x * uAsp * uTan, vP.y * uTan, -1.0));',
     '  d = uRot * d;',
@@ -347,12 +359,13 @@ function initGL() {
     '  float v = 0.5 - lat / 3.14159265;',
     '  float u;',
     '  if (uHalf > 0.5) {',
-    '    if (abs(lon) > 1.5707963) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }',
+    '    if (abs(lon) > 1.5707963) { gl_FragColor = (uCut > 0.5) ? vec4(0.0) : vec4(0.0, 0.0, 0.0, 1.0); return; }',
     '    u = lon / 3.14159265 + 0.5;',
     '  } else { u = lon / 6.2831853 + 0.5; }',
     '  vec3 c = texture2D(uTex, uOff + vec2(u, v) * uScl).rgb;',
-    '  if (uKeyOn > 0.5) { float dist = distance(c, uKey); float a = clamp((dist - uTS.x) / uTS.y, 0.0, 1.0); c *= a; }',
-    '  gl_FragColor = vec4(c, 1.0);',
+    '  float al = 1.0;',
+    '  if (uKeyOn > 0.5 || uCut > 0.5) { vec3 kc = (uKeyOn > 0.5) ? uKey : vec3(0.0); float dist = distance(c, kc); al = clamp((dist - uTS.x) / uTS.y, 0.0, 1.0); }',
+    '  if (uCut > 0.5) { gl_FragColor = vec4(c, al); } else { gl_FragColor = vec4(c * al, 1.0); }',
     '}'
   ].join('\n');
   const mk = (type, code) => {
@@ -372,7 +385,7 @@ function initGL() {
   const loc = gl.getAttribLocation(glProg, 'a');
   gl.enableVertexAttribArray(loc);
   gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-  ['uTex','uRot','uTan','uAsp','uHalf','uOff','uScl','uKey','uTS','uKeyOn'].forEach(n => U[n] = gl.getUniformLocation(glProg, n));
+  ['uTex','uRot','uTan','uAsp','uHalf','uOff','uScl','uKey','uTS','uKeyOn','uCut'].forEach(n => U[n] = gl.getUniformLocation(glProg, n));
   glTex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, glTex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -408,6 +421,7 @@ function drawGL() {
   gl.uniform3f(U.uKey, col[0], col[1], col[2]);
   gl.uniform2f(U.uTS, (+$('tol').value) / 255, Math.max(0.001, (+$('soft').value) / 255));
   gl.uniform1f(U.uKeyOn, $('key').value === 'color' ? 1 : 0);
+  gl.uniform1f(U.uCut, $('comp').value === 'cut' ? 1 : 0);
   gl.uniform1i(U.uTex, 0);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
@@ -571,6 +585,7 @@ $('recenter').addEventListener('click', recenter);
 $('layout').addEventListener('change', () => { autoStretch(); layout(); });
 $('stretch').addEventListener('change', layout);
 $('key').addEventListener('change', drawFrame);
+$('comp').addEventListener('change', () => { document.body.classList.toggle('add', $('comp').value === 'add'); drawFrame(); });
 $('tol').addEventListener('input', drawFrame);
 $('soft').addEventListener('input', drawFrame);
 $('pick').addEventListener('click', () => {
