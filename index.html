@@ -9,7 +9,8 @@
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; color: #fff; touch-action: none; user-select: none; -webkit-user-select: none; }
   #cam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
   #out { position: absolute; left: 50%; top: 50%; mix-blend-mode: screen; }
-  body.picking #out { cursor: crosshair; }
+  #gl { position: absolute; inset: 0; width: 100%; height: 100%; mix-blend-mode: screen; display: none; }
+  body.picking #out, body.picking #gl { cursor: crosshair; }
   #src { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
   #msg { position: absolute; top: calc(10px + env(safe-area-inset-top, 0px)); left: 12px; right: 60px; font-size: 14px; text-shadow: 0 0 4px #000; pointer-events: none; }
   #panel {
@@ -37,6 +38,7 @@
 <body>
 <video id="cam" autoplay playsinline muted></video>
 <canvas id="out" width="16" height="9"></canvas>
+<canvas id="gl"></canvas>
 <video id="src" loop playsinline></video>
 <div id="msg">Pick a video to begin.</div>
 <button id="show">Controls</button>
@@ -60,6 +62,18 @@
 
   <div class="row sep"></div>
   <div class="row">
+    <span class="lbl">Projection</span>
+    <select id="proj">
+      <option value="flat">Flat screen (drag to move)</option>
+      <option value="sphere">360 sphere (look around)</option>
+      <option value="half">180 VR (look around)</option>
+    </select>
+  </div>
+  <div class="row">
+    <button id="gyro" class="on">Gyro look: ON</button>
+    <button id="recenter">Recenter</button>
+  </div>
+  <div class="row">
     <span class="lbl">3D layout</span>
     <select id="layout">
       <option value="flat">Normal (flat video)</option>
@@ -70,7 +84,7 @@
     </select>
   </div>
   <div class="row">
-    <label><input id="stretch" type="checkbox"> Stretch squeezed 3D (half-width/height)</label>
+    <label><input id="stretch" type="checkbox"> Stretch squeezed 3D (flat screen only)</label>
   </div>
 
   <div class="row sep"></div>
@@ -91,23 +105,29 @@
   <div class="row"><span class="lbl">Edge softness</span><input id="soft" type="range" min="1" max="150" value="40"></div>
 
   <div class="row sep"></div>
-  <div class="row"><span class="lbl">Size</span><input id="size" type="range" min="20" max="300" value="100"></div>
+  <div class="row"><span class="lbl">Size (flat)</span><input id="size" type="range" min="20" max="300" value="100"></div>
   <div class="row"><span class="lbl">Brightness</span><input id="bright" type="range" min="50" max="250" value="100"></div>
   <div class="row"><button id="reset">Reset position and size</button></div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
-const cam = $('cam'), src = $('src'), out = $('out'), msg = $('msg'), panel = $('panel'), showBtn = $('show');
+const cam = $('cam'), src = $('src'), out = $('out'), glc = $('gl'), msg = $('msg'), panel = $('panel'), showBtn = $('show');
 const ctx = out.getContext('2d', { willReadFrequently: true });
 const work = document.createElement('canvas');
 const wctx = work.getContext('2d', { willReadFrequently: true });
-const MAX_W = 640;           // processing width, keeps keying smooth
+const MAX_W = 640;
 let facing = 'environment', stream = null, mode = 'phone';
-let G = null;                // current geometry
+let G = null;
 let key = { r: 0, g: 255, b: 0 };
 let picking = false;
 let tx = 0, ty = 0, scale = 1;
+
+/* sphere-view state */
+let fov = 75 * Math.PI / 180;      // vertical field of view
+let yawOff = 0, pitchOff = 0;      // manual look offsets (drag)
+let gyroOn = true, hasOri = false, devR = null;
+const proj = () => $('proj').value;
 
 /* ---------- camera ---------- */
 async function startCamera() {
@@ -135,12 +155,23 @@ function setMode(m) {
   if (m === 'glasses') msg.textContent = 'Glasses view: tap to show/hide controls, drag to move.';
 }
 
-/* ---------- geometry (flat / side-by-side / top-bottom) ---------- */
+/* ---------- layout rect (which part of the video to use) ---------- */
+function layoutRect() {
+  switch ($('layout').value) {
+    case 'sbsL': return { ox: 0,   oy: 0,   sx: 0.5, sy: 1 };
+    case 'sbsR': return { ox: 0.5, oy: 0,   sx: 0.5, sy: 1 };
+    case 'tbT':  return { ox: 0,   oy: 0,   sx: 1,   sy: 0.5 };
+    case 'tbB':  return { ox: 0,   oy: 0.5, sx: 1,   sy: 0.5 };
+    default:     return { ox: 0,   oy: 0,   sx: 1,   sy: 1 };
+  }
+}
+
+/* ---------- flat screen path (2D canvas) ---------- */
 function autoStretch() {
   const vw = src.videoWidth, vh = src.videoHeight;
   if (!vw) return;
   const l = $('layout').value, ar = vw / vh;
-  if (l === 'sbsL' || l === 'sbsR') $('stretch').checked = ar < 2.5;   // 16:9 file = squeezed, 32:9 = full
+  if (l === 'sbsL' || l === 'sbsR') $('stretch').checked = ar < 2.5;
   else if (l === 'tbT' || l === 'tbB') $('stretch').checked = ar > 1.2;
   else $('stretch').checked = false;
 }
@@ -168,8 +199,8 @@ function layout() {
   drawFrame();
 }
 
-/* ---------- rendering ---------- */
 function drawFrame() {
+  if (proj() !== 'flat') return;
   if (!G || src.readyState < 2) return;
   wctx.drawImage(src, G.sx, G.sy, G.sw, G.sh, 0, 0, G.w, G.h);
   ctx.drawImage(work, 0, 0);
@@ -205,7 +236,198 @@ function startLoop() {
 
 function applyT() {
   out.style.transform = 'translate(-50%,-50%) translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')';
-  out.style.filter = 'brightness(' + ($('bright').value / 100) + ')';
+  const f = 'brightness(' + ($('bright').value / 100) + ')';
+  out.style.filter = f;
+  glc.style.filter = f;
+}
+
+/* ---------- small 3x3 matrix helpers (row-major) ---------- */
+const I3 = [1,0,0, 0,1,0, 0,0,1];
+function mul3(A, B) {
+  const C = new Array(9);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    C[i*3+j] = A[i*3]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+  return C;
+}
+function Ry(t) { const c = Math.cos(t), s = Math.sin(t); return [c,0,s, 0,1,0, -s,0,c]; }
+function Rx(t) { const c = Math.cos(t), s = Math.sin(t); return [1,0,0, 0,c,-s, 0,s,c]; }
+function mulV(M, v) {
+  return [M[0]*v[0]+M[1]*v[1]+M[2]*v[2], M[3]*v[0]+M[4]*v[1]+M[5]*v[2], M[6]*v[0]+M[7]*v[1]+M[8]*v[2]];
+}
+function qmul(a, b) {
+  return [
+    a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
+    a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
+    a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
+    a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2]
+  ];
+}
+function qToMat(q) {
+  const x = q[0], y = q[1], z = q[2], w = q[3];
+  return [
+    1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w),
+    2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w),
+    2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)
+  ];
+}
+
+/* ---------- gyro ---------- */
+function onOrient(e) {
+  if (e.alpha == null || e.beta == null || e.gamma == null) return;
+  const first = !hasOri;
+  hasOri = true;
+  const d2r = Math.PI / 180;
+  const a = e.alpha * d2r, b = e.beta * d2r, gm = e.gamma * d2r;
+  const o = ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * d2r;
+  // Euler (beta, alpha, -gamma) in YXZ order
+  const ex = b, ey = a, ez = -gm;
+  const c1 = Math.cos(ex/2), c2 = Math.cos(ey/2), c3 = Math.cos(ez/2);
+  const s1 = Math.sin(ex/2), s2 = Math.sin(ey/2), s3 = Math.sin(ez/2);
+  let q = [
+    s1*c2*c3 + c1*s2*s3,
+    c1*s2*c3 - s1*c2*s3,
+    c1*c2*s3 - s1*s2*c3,
+    c1*c2*c3 + s1*s2*s3
+  ];
+  q = qmul(q, [-Math.SQRT1_2, 0, 0, Math.SQRT1_2]);              // camera looks out the back of the phone
+  q = qmul(q, [0, 0, Math.sin(-o/2), Math.cos(-o/2)]);            // screen rotation
+  devR = qToMat(q);
+  if (first && proj() !== 'flat') recenter();
+}
+let oriListening = false;
+async function enableGyro() {
+  gyroOn = true;
+  $('gyro').classList.add('on');
+  $('gyro').textContent = 'Gyro look: ON';
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== 'granted') { msg.textContent = 'Motion permission denied. Drag to look around.'; disableGyro(); return; }
+    }
+  } catch (e) { /* ignore */ }
+  if (!oriListening) { window.addEventListener('deviceorientation', onOrient, true); oriListening = true; }
+  setTimeout(() => {
+    if (!hasOri && gyroOn && proj() !== 'flat') { msg.textContent = 'No motion sensor data. Drag to look around.'; disableGyro(); }
+  }, 1500);
+  if (hasOri) recenter();
+}
+function disableGyro() {
+  gyroOn = false;
+  $('gyro').classList.remove('on');
+  $('gyro').textContent = 'Gyro look: OFF';
+}
+function recenter() {
+  pitchOff = 0;
+  if (gyroOn && devR) yawOff = Math.atan2(-devR[2], devR[8]);   // make current heading the video center
+  else yawOff = 0;
+}
+function viewMatrix() {
+  const Rd = (gyroOn && devR) ? devR : I3;
+  return mul3(Ry(yawOff), mul3(Rd, Rx(pitchOff)));
+}
+
+/* ---------- WebGL sphere path ---------- */
+let gl = null, glProg = null, glTex = null, U = {};
+let lastT = -1, forceUpload = true;
+function initGL() {
+  if (gl) return true;
+  gl = glc.getContext('webgl', { antialias: false, premultipliedAlpha: false });
+  if (!gl) { msg.textContent = 'WebGL not available on this browser.'; return false; }
+  const vs = 'attribute vec2 a; varying vec2 vP; void main(){ vP = a; gl_Position = vec4(a, 0.0, 1.0); }';
+  const fs = [
+    'precision highp float;',
+    'varying vec2 vP;',
+    'uniform sampler2D uTex; uniform mat3 uRot; uniform float uTan; uniform float uAsp; uniform float uHalf;',
+    'uniform vec2 uOff; uniform vec2 uScl; uniform vec3 uKey; uniform vec2 uTS; uniform float uKeyOn;',
+    'void main(){',
+    '  vec3 d = normalize(vec3(vP.x * uAsp * uTan, vP.y * uTan, -1.0));',
+    '  d = uRot * d;',
+    '  float lon = atan(d.x, -d.z);',
+    '  float lat = asin(clamp(d.y, -1.0, 1.0));',
+    '  float v = 0.5 - lat / 3.14159265;',
+    '  float u;',
+    '  if (uHalf > 0.5) {',
+    '    if (abs(lon) > 1.5707963) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }',
+    '    u = lon / 3.14159265 + 0.5;',
+    '  } else { u = lon / 6.2831853 + 0.5; }',
+    '  vec3 c = texture2D(uTex, uOff + vec2(u, v) * uScl).rgb;',
+    '  if (uKeyOn > 0.5) { float dist = distance(c, uKey); float a = clamp((dist - uTS.x) / uTS.y, 0.0, 1.0); c *= a; }',
+    '  gl_FragColor = vec4(c, 1.0);',
+    '}'
+  ].join('\n');
+  const mk = (type, code) => {
+    const s = gl.createShader(type); gl.shaderSource(s, code); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); }
+    return s;
+  };
+  glProg = gl.createProgram();
+  gl.attachShader(glProg, mk(gl.VERTEX_SHADER, vs));
+  gl.attachShader(glProg, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(glProg);
+  if (!gl.getProgramParameter(glProg, gl.LINK_STATUS)) { msg.textContent = 'Sphere shader failed to build.'; gl = null; return false; }
+  gl.useProgram(glProg);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(glProg, 'a');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  ['uTex','uRot','uTan','uAsp','uHalf','uOff','uScl','uKey','uTS','uKeyOn'].forEach(n => U[n] = gl.getUniformLocation(glProg, n));
+  glTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, glTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,255]));
+  return true;
+}
+function resizeGL() {
+  const pr = Math.min(window.devicePixelRatio || 1, 1.5);
+  glc.width = Math.round(innerWidth * pr);
+  glc.height = Math.round(innerHeight * pr);
+  if (gl) gl.viewport(0, 0, glc.width, glc.height);
+}
+function drawGL() {
+  if (!initGL()) return;
+  if (glc.width !== Math.round(innerWidth * Math.min(window.devicePixelRatio || 1, 1.5))) resizeGL();
+  gl.viewport(0, 0, glc.width, glc.height);
+  if (src.readyState >= 2 && src.videoWidth && (forceUpload || src.currentTime !== lastT)) {
+    gl.bindTexture(gl.TEXTURE_2D, glTex);
+    try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src); } catch (e) { /* video too large */ }
+    lastT = src.currentTime; forceUpload = false;
+  }
+  const R = viewMatrix(), r = layoutRect();
+  const col = [key.r / 255, key.g / 255, key.b / 255];
+  gl.uniformMatrix3fv(U.uRot, false, [R[0],R[3],R[6], R[1],R[4],R[7], R[2],R[5],R[8]]);
+  gl.uniform1f(U.uTan, Math.tan(fov / 2));
+  gl.uniform1f(U.uAsp, innerWidth / innerHeight);
+  gl.uniform1f(U.uHalf, proj() === 'half' ? 1 : 0);
+  gl.uniform2f(U.uOff, r.ox, r.oy);
+  gl.uniform2f(U.uScl, r.sx, r.sy);
+  gl.uniform3f(U.uKey, col[0], col[1], col[2]);
+  gl.uniform2f(U.uTS, (+$('tol').value) / 255, Math.max(0.001, (+$('soft').value) / 255));
+  gl.uniform1f(U.uKeyOn, $('key').value === 'color' ? 1 : 0);
+  gl.uniform1i(U.uTex, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+let glRunning = false;
+function glLoop() {
+  if (proj() === 'flat') { glRunning = false; return; }
+  drawGL();
+  requestAnimationFrame(glLoop);
+}
+function setProj() {
+  const p = proj();
+  const flat = p === 'flat';
+  out.style.display = flat ? 'block' : 'none';
+  glc.style.display = flat ? 'none' : 'block';
+  forceUpload = true;
+  if (flat) { drawFrame(); return; }
+  resizeGL();
+  if (gyroOn) enableGyro(); else recenter();
+  msg.textContent = 'Look around: move the phone, or drag. Pinch to zoom.';
+  if (!glRunning) { glRunning = true; glLoop(); }
 }
 
 /* ---------- color picking ---------- */
@@ -224,7 +446,15 @@ function setPicking(on) {
   if (on) msg.textContent = 'Tap the background color on the video.';
   else if (msg.textContent.startsWith('Tap the background')) msg.textContent = '';
 }
+function averageAndSet(data, n) {
+  let R = 0, Gc = 0, B = 0;
+  for (let i = 0; i < data.length; i += 4) { R += data[i]; Gc += data[i + 1]; B += data[i + 2]; }
+  setKey(Math.round(R / n), Math.round(Gc / n), Math.round(B / n));
+  setPicking(false);
+  msg.textContent = 'Color picked. Adjust Tolerance if needed.';
+}
 function sampleAt(cx, cy) {
+  if (proj() !== 'flat') { sampleSphere(cx, cy); return; }
   if (!G) { msg.textContent = 'Pick a video first.'; return; }
   const r = out.getBoundingClientRect();
   const px = Math.floor((cx - r.left) / r.width * G.w);
@@ -232,17 +462,33 @@ function sampleAt(cx, cy) {
   if (px < 0 || py < 0 || px >= G.w || py >= G.h) { msg.textContent = 'Tap on the video itself.'; return; }
   const x0 = Math.max(0, px - 2), y0 = Math.max(0, py - 2);
   const w = Math.min(5, G.w - x0), h = Math.min(5, G.h - y0);
-  const d = wctx.getImageData(x0, y0, w, h).data;
-  let R = 0, Gc = 0, B = 0, n = w * h;
-  for (let i = 0; i < d.length; i += 4) { R += d[i]; Gc += d[i + 1]; B += d[i + 2]; }
-  setKey(Math.round(R / n), Math.round(Gc / n), Math.round(B / n));
-  setPicking(false);
-  msg.textContent = 'Color picked. Adjust Tolerance if needed.';
+  averageAndSet(wctx.getImageData(x0, y0, w, h).data, w * h);
+}
+function sampleSphere(cx, cy) {
+  const vw = src.videoWidth, vh = src.videoHeight;
+  if (!vw) { msg.textContent = 'Pick a video first.'; return; }
+  const th = Math.tan(fov / 2), asp = innerWidth / innerHeight;
+  const nx = (cx / innerWidth) * 2 - 1, ny = 1 - (cy / innerHeight) * 2;
+  let d = [nx * asp * th, ny * th, -1];
+  const len = Math.hypot(d[0], d[1], d[2]);
+  d = mulV(viewMatrix(), [d[0] / len, d[1] / len, d[2] / len]);
+  const lon = Math.atan2(d[0], -d[2]), lat = Math.asin(Math.max(-1, Math.min(1, d[1])));
+  const half = proj() === 'half';
+  if (half && Math.abs(lon) > Math.PI / 2) { msg.textContent = 'Tap on the video itself.'; return; }
+  const u = half ? lon / Math.PI + 0.5 : lon / (2 * Math.PI) + 0.5;
+  const v = 0.5 - lat / Math.PI;
+  const rc = layoutRect();
+  const px = Math.round((rc.ox + u * rc.sx) * vw), py = Math.round((rc.oy + v * rc.sy) * vh);
+  const x0 = Math.max(0, Math.min(vw - 5, px - 2)), y0 = Math.max(0, Math.min(vh - 5, py - 2));
+  const sc = document.createElement('canvas'); sc.width = 5; sc.height = 5;
+  const sctx = sc.getContext('2d', { willReadFrequently: true });
+  sctx.drawImage(src, x0, y0, 5, 5, 0, 0, 5, 5);
+  averageAndSet(sctx.getImageData(0, 0, 5, 5).data, 25);
 }
 
 /* ---------- drag, pinch, tap ---------- */
 const ptrs = new Map();
-let g = { moved: false, pinched: false, sx: 0, sy: 0, tx0: 0, ty0: 0, d0: 1, s0: 1 };
+let g = { moved: false, pinched: false, sx: 0, sy: 0, lx: 0, ly: 0, tx0: 0, ty0: 0, d0: 1, s0: 1, f0: 1 };
 
 function togglePanel() {
   const hidden = panel.classList.toggle('hidden');
@@ -250,26 +496,39 @@ function togglePanel() {
 }
 window.addEventListener('pointerdown', e => {
   if (e.target.closest('#panel, #show')) return;
-  if (ptrs.size === 0) g = { moved: false, pinched: false, sx: 0, sy: 0, tx0: 0, ty0: 0, d0: 1, s0: 1 };
+  if (ptrs.size === 0) g = { moved: false, pinched: false, sx: 0, sy: 0, lx: 0, ly: 0, tx0: 0, ty0: 0, d0: 1, s0: 1, f0: 1 };
   ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
-  if (ptrs.size === 1) { g.sx = e.clientX; g.sy = e.clientY; g.tx0 = tx; g.ty0 = ty; }
+  if (ptrs.size === 1) { g.sx = g.lx = e.clientX; g.sy = g.ly = e.clientY; g.tx0 = tx; g.ty0 = ty; }
   else if (ptrs.size === 2) {
     const [a, b] = [...ptrs.values()];
-    g.d0 = Math.hypot(a.x - b.x, a.y - b.y) || 1; g.s0 = scale; g.pinched = true;
+    g.d0 = Math.hypot(a.x - b.x, a.y - b.y) || 1; g.s0 = scale; g.f0 = fov; g.pinched = true;
   }
 });
 window.addEventListener('pointermove', e => {
   if (!ptrs.has(e.pointerId)) return;
   ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const sphere = proj() !== 'flat';
   if (ptrs.size === 1 && !g.pinched) {
     const dx = e.clientX - g.sx, dy = e.clientY - g.sy;
     if (Math.hypot(dx, dy) > 8) g.moved = true;
-    if (g.moved && !picking) { tx = g.tx0 + dx; ty = g.ty0 + dy; applyT(); }
+    if (g.moved && !picking) {
+      if (sphere) {
+        const k = fov / innerHeight;                       // radians per pixel
+        yawOff += (e.clientX - g.lx) * k;
+        pitchOff = Math.max(-1.4, Math.min(1.4, pitchOff + (e.clientY - g.ly) * k));
+      } else { tx = g.tx0 + dx; ty = g.ty0 + dy; applyT(); }
+    }
+    g.lx = e.clientX; g.ly = e.clientY;
   } else if (ptrs.size === 2) {
     const [a, b] = [...ptrs.values()];
-    scale = Math.min(3, Math.max(0.2, g.s0 * (Math.hypot(a.x - b.x, a.y - b.y) / g.d0)));
-    $('size').value = Math.round(scale * 100);
-    applyT();
+    const ratio = Math.hypot(a.x - b.x, a.y - b.y) / g.d0;
+    if (sphere) {
+      fov = Math.min(120 * Math.PI / 180, Math.max(30 * Math.PI / 180, g.f0 / ratio));
+    } else {
+      scale = Math.min(3, Math.max(0.2, g.s0 * ratio));
+      $('size').value = Math.round(scale * 100);
+      applyT();
+    }
   }
 });
 function endPtr(e) {
@@ -290,10 +549,11 @@ $('file').addEventListener('change', e => {
   src.src = URL.createObjectURL(f);
   src.play().catch(() => {});
   msg.textContent = '';
+  forceUpload = true;
   startLoop();
 });
-src.addEventListener('loadedmetadata', () => { autoStretch(); layout(); });
-src.addEventListener('loadeddata', drawFrame);
+src.addEventListener('loadedmetadata', () => { autoStretch(); layout(); forceUpload = true; });
+src.addEventListener('loadeddata', () => { forceUpload = true; drawFrame(); });
 $('play').addEventListener('click', () => { if (src.src) src.paused ? src.play() : src.pause(); });
 $('flip').addEventListener('click', () => { facing = facing === 'environment' ? 'user' : 'environment'; startCamera(); });
 $('mPhone').addEventListener('click', () => setMode('phone'));
@@ -305,6 +565,9 @@ $('full').addEventListener('click', () => {
 $('hide').addEventListener('click', () => { panel.classList.add('hidden'); showBtn.style.display = 'block'; });
 showBtn.addEventListener('click', () => { panel.classList.remove('hidden'); showBtn.style.display = 'none'; });
 
+$('proj').addEventListener('change', setProj);
+$('gyro').addEventListener('click', () => { if (gyroOn) { disableGyro(); recenter(); } else enableGyro(); });
+$('recenter').addEventListener('click', recenter);
 $('layout').addEventListener('change', () => { autoStretch(); layout(); });
 $('stretch').addEventListener('change', layout);
 $('key').addEventListener('change', drawFrame);
@@ -312,7 +575,7 @@ $('tol').addEventListener('input', drawFrame);
 $('soft').addEventListener('input', drawFrame);
 $('pick').addEventListener('click', () => {
   setPicking(!picking);
-  panel.classList.add('hidden'); showBtn.style.display = 'block';   // clear the screen so you can tap the video
+  panel.classList.add('hidden'); showBtn.style.display = 'block';
 });
 $('kc').addEventListener('input', e => {
   const h = e.target.value;
@@ -320,8 +583,11 @@ $('kc').addEventListener('input', e => {
 });
 $('size').addEventListener('input', e => { scale = e.target.value / 100; applyT(); });
 $('bright').addEventListener('input', applyT);
-$('reset').addEventListener('click', () => { tx = 0; ty = 0; scale = 1; $('size').value = 100; applyT(); });
-window.addEventListener('resize', layout);
+$('reset').addEventListener('click', () => {
+  tx = 0; ty = 0; scale = 1; $('size').value = 100;
+  fov = 75 * Math.PI / 180; recenter(); applyT();
+});
+window.addEventListener('resize', () => { layout(); resizeGL(); });
 
 applyT();
 startCamera();
